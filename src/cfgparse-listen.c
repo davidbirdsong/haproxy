@@ -1415,17 +1415,30 @@ static int proxy_parse_balance(char **args, int section_type, struct proxy *curp
 	else if (strcmp(args[0], "hash-type") == 0) { /* set hashing method */
 		/*
 		 * The syntax for hash-type config element is
-		 * hash-type {map-based|consistent} [[<algo>] avalanche]
+		 * hash-type {map-based|consistent|rendezvous-subset} [[<algo>] avalanche]
 		 *
 		 * The default hash function is sdbm for map-based and sdbm+avalanche for consistent.
 		 */
 		curpx->lbprm.algo &= ~(BE_LB_HASH_TYPE | BE_LB_HASH_FUNC | BE_LB_HASH_MOD);
+
+		/* each "hash-type" line fully redefines the hashing config, including
+		 * the rendezvous-subset-only knobs below, so start from a clean slate.
+		 */
+		curpx->lbprm.hash_subset_mode = BE_LB_HSM_NONE;
+		curpx->lbprm.hash_threshold = 0;
+		curpx->lbprm.hash_decay_kind = BE_LB_HDECAY_NONE;
+		curpx->lbprm.hash_decay_rate = 0;
+		curpx->lbprm.hash_candidates = 0;
+		ha_free(&curpx->lbprm.hash_candidates_str);
 
 		if (strcmp(args[1], "consistent") == 0) {	/* use consistent hashing */
 			curpx->lbprm.algo |= BE_LB_HASH_CONS;
 		}
 		else if (strcmp(args[1], "map-based") == 0) {	/* use map-based hashing */
 			curpx->lbprm.algo |= BE_LB_HASH_MAP;
+		}
+		else if (strcmp(args[1], "rendezvous-subset") == 0) { /* use rendezvous hashing over a fixed top-Y subset */
+			curpx->lbprm.algo |= BE_LB_HASH_RDVZ;
 		}
 		else if (strcmp(args[1], "avalanche") == 0) {
 			memprintf(err, "experimental feature '%s %s' is not supported anymore, "
@@ -1434,12 +1447,18 @@ static int proxy_parse_balance(char **args, int section_type, struct proxy *curp
 			return -1;
 		}
 		else {
-			memprintf(err, "'%s' only supports 'consistent' and 'map-based'.", args[0]);
+			memprintf(err, "'%s' only supports 'consistent', 'map-based' and 'rendezvous-subset'.", args[0]);
 			return -1;
 		}
 
 		/* set the hash function to use */
-		if (!*args[2]) {
+		if ((curpx->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_RDVZ) {
+			if (*args[2]) {
+				memprintf(err, "'%s rendezvous-subset' takes no further argument.", args[0]);
+				return -1;
+			}
+		}
+		else if (!*args[2]) {
 			/* the default algo is sdbm */
 			curpx->lbprm.algo |= BE_LB_HFCN_SDBM;
 
@@ -1473,6 +1492,10 @@ static int proxy_parse_balance(char **args, int section_type, struct proxy *curp
 		}
 	}
 	else if (strcmp(args[0], "hash-balance-factor") == 0) {
+		if ((curpx->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_RDVZ) {
+			memprintf(err, "'%s' is not compatible with 'hash-type rendezvous-subset'.", args[0]);
+			return -1;
+		}
 		if (*(args[1]) == 0) {
 			memprintf(err, "'%s' expects an integer argument.", args[0]);
 			return -1;
@@ -1483,6 +1506,106 @@ static int proxy_parse_balance(char **args, int section_type, struct proxy *curp
 			memprintf(err, "'%s' must be 0 or greater than 100.", args[0]);
 			return -1;
 		}
+	}
+	else if (strcmp(args[0], "hash-candidates") == 0) {
+		char *endp;
+		long value;
+
+		if ((curpx->lbprm.algo & BE_LB_HASH_TYPE) != BE_LB_HASH_RDVZ) {
+			memprintf(err, "'%s' only valid after 'hash-type rendezvous-subset'.", args[0]);
+			return -1;
+		}
+		if (*(args[1]) == 0) {
+			memprintf(err, "'%s' expects an integer or a sample expression.", args[0]);
+			return -1;
+		}
+		if (too_many_args(1, args, err, NULL))
+			return -1;
+
+		value = strtol(args[1], &endp, 0);
+		if (*endp == '\0') {
+			if (value <= 0) {
+				memprintf(err, "'%s' count must be greater than 0.", args[0]);
+				return -1;
+			}
+			ha_free(&curpx->lbprm.hash_candidates_str);
+			curpx->lbprm.hash_candidates = value;
+		}
+		else {
+			curpx->lbprm.hash_candidates = 0;
+			ha_free(&curpx->lbprm.hash_candidates_str);
+			curpx->lbprm.hash_candidates_str = strdup(args[1]);
+		}
+	}
+	else if (strcmp(args[0], "hash-subset-mode") == 0) {
+		if ((curpx->lbprm.algo & BE_LB_HASH_TYPE) != BE_LB_HASH_RDVZ) {
+			memprintf(err, "'%s' only valid after 'hash-type rendezvous-subset'.", args[0]);
+			return -1;
+		}
+		if (too_many_args(1, args, err, NULL))
+			return -1;
+
+		if (strcmp(args[1], "leastconn") == 0)
+			curpx->lbprm.hash_subset_mode = BE_LB_HSM_LEASTCONN;
+		else if (strcmp(args[1], "priority") == 0)
+			curpx->lbprm.hash_subset_mode = BE_LB_HSM_PRIORITY;
+		else {
+			memprintf(err, "'%s' only supports 'leastconn' and 'priority'.", args[0]);
+			return -1;
+		}
+	}
+	else if (strcmp(args[0], "hash-threshold") == 0) {
+		char *endp;
+		long value;
+
+		if (curpx->lbprm.hash_subset_mode != BE_LB_HSM_PRIORITY) {
+			memprintf(err, "'%s' only valid after 'hash-subset-mode priority'.", args[0]);
+			return -1;
+		}
+		if (*(args[1]) == 0) {
+			memprintf(err, "'%s' expects a percentage.", args[0]);
+			return -1;
+		}
+		if (too_many_args(1, args, err, NULL))
+			return -1;
+
+		value = strtol(args[1], &endp, 0);
+		if (*endp != '\0' || value < 0 || value > 100) {
+			memprintf(err, "'%s' expects an integer percentage between 0 and 100.", args[0]);
+			return -1;
+		}
+		curpx->lbprm.hash_threshold = value;
+	}
+	else if (strcmp(args[0], "hash-decay") == 0) {
+		char *endp;
+		double rate;
+
+		if (curpx->lbprm.hash_subset_mode != BE_LB_HSM_PRIORITY) {
+			memprintf(err, "'%s' only valid after 'hash-subset-mode priority'.", args[0]);
+			return -1;
+		}
+		if (too_many_args(2, args, err, NULL))
+			return -1;
+
+		if (strcmp(args[1], "geometric") == 0)
+			curpx->lbprm.hash_decay_kind = BE_LB_HDECAY_GEOMETRIC;
+		else if (strcmp(args[1], "harmonic") == 0)
+			curpx->lbprm.hash_decay_kind = BE_LB_HDECAY_HARMONIC;
+		else {
+			memprintf(err, "'%s' only supports 'geometric' and 'harmonic'.", args[0]);
+			return -1;
+		}
+
+		if (*(args[2]) == 0) {
+			memprintf(err, "'%s' expects a decay rate.", args[0]);
+			return -1;
+		}
+		rate = strtod(args[2], &endp);
+		if (*endp != '\0' || rate <= 0) {
+			memprintf(err, "'%s' expects a decay rate as a positive number.", args[0]);
+			return -1;
+		}
+		curpx->lbprm.hash_decay_rate = rate;
 	}
 	else {
 		BUG_ON(1, "unhandled keyword in proxy_parse_balance().");
@@ -3023,6 +3146,10 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_LISTEN, "fullconn", proxy_parse_conn_limits },
 	{ CFG_LISTEN, "grace", proxy_parse_removed_kw },
 	{ CFG_LISTEN, "hash-balance-factor", proxy_parse_balance },
+	{ CFG_LISTEN, "hash-candidates", proxy_parse_balance },
+	{ CFG_LISTEN, "hash-decay", proxy_parse_balance },
+	{ CFG_LISTEN, "hash-subset-mode", proxy_parse_balance },
+	{ CFG_LISTEN, "hash-threshold", proxy_parse_balance },
 	{ CFG_LISTEN, "hash-type", proxy_parse_balance },
 	{ CFG_LISTEN, "http-after-response", proxy_parse_http_rules },
 	{ CFG_LISTEN, "http-request", proxy_parse_http_rules },

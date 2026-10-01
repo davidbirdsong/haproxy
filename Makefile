@@ -987,7 +987,7 @@ OBJS += src/mux_h1.o src/log.o						\
         src/tcp_sample.o src/mjson.o src/h1_htx.o src/tcp_act.o		\
         src/ring.o src/flt_bwlim.o src/acl.o src/thread.o src/queue.o	\
         src/http_rules.o src/http.o src/channel.o src/proto_tcp.o	\
-        src/mqtt.o src/lb_chash.o src/extcheck.o src/dns_ring.o		\
+        src/mqtt.o src/lb_chash.o src/lb_rdvz.o src/extcheck.o src/dns_ring.o	\
         src/errors.o src/ncbuf.o src/compression.o src/http_conv.o	\
         src/frontend.o src/stats-json.o src/proto_sockpair.o		\
         src/raw_sock.o src/action.o src/stats-file.o src/buf.o		\
