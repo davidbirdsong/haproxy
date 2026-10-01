@@ -270,6 +270,7 @@ static inline void proxy_free_common(struct proxy *px)
 	ha_free(&px->cookie_domain);
 	ha_free(&px->cookie_attrs);
 	ha_free(&px->lbprm.arg_str);
+	ha_free(&px->lbprm.hash_candidates_str);
 	ha_free(&px->capture_name);
 	istfree(&px->monitor_uri);
 	ha_free(&px->conn_src.iface_name);
@@ -344,11 +345,18 @@ void deinit_proxy(struct proxy *p)
 
 	/* regular proxy specific cleanup */
 	release_sample_expr(p->lbprm.expr);
+	release_sample_expr(p->lbprm.hash_candidates_expr);
 	free(p->server_state_file_name);
 	free(p->invalid_rep);
 	free(p->invalid_req);
 	if ((p->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_MAP)
 		free(p->lbprm.map.srv);
+	/* BE_LB_LKUP_RDVZ: no explicit free here - rdvz_server_deinit() (called
+	 * per-server, further down, via the generic p->lbprm.ops->server_deinit
+	 * loop over p->servers) already tears down p->lbprm.rdvz.tbl
+	 * progressively as each server is removed; freeing it here too would
+	 * race/double-free against that loop.
+	 */
 
 	list_for_each_entry_safe(cond, condb, &p->mon_fail_cond, list) {
 		LIST_DELETE(&cond->list);
@@ -1057,6 +1065,10 @@ proxy_parse_hash_preserve_affinity(char **args, int section, struct proxy *curpx
 	}
 	if (!(curpx->cap & PR_CAP_BE)) {
 		memprintf(err, "'%s' only available in backend or listen section", args[0]);
+		return -1;
+	}
+	if ((curpx->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_RDVZ) {
+		memprintf(err, "'%s' is not compatible with 'hash-type rendezvous-subset'", args[0]);
 		return -1;
 	}
 
@@ -2448,6 +2460,42 @@ int proxy_finalize(struct proxy *px, int *err_code)
 			px->http_needed |= !!(px->lbprm.expr->fetch->use & SMP_USE_HTTP_ANY);
 	}
 
+	/* "hash-candidates" needs to compile its expression when a non-integer
+	 * value was given at parse time (a literal count needs no compilation).
+	 */
+	if ((px->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_RDVZ &&
+	    px->lbprm.hash_candidates_str) {
+		int idx = 0;
+		const char *args[] = {
+			px->lbprm.hash_candidates_str,
+			NULL,
+		};
+
+		err = NULL;
+		px->conf.args.ctx = ARGC_USRV; // same context as use_server.
+		px->lbprm.hash_candidates_expr =
+			sample_parse_expr((char **)args, &idx,
+					  px->conf.file, px->conf.line,
+					  &err, &px->conf.args, NULL);
+
+		if (!px->lbprm.hash_candidates_expr) {
+			ha_alert("%s '%s' [%s:%d]: failed to parse 'hash-candidates' expression '%s' in : %s.\n",
+			         proxy_type_str(px), px->id,
+			         px->conf.file, px->conf.line,
+			         px->lbprm.hash_candidates_str, err);
+			ha_free(&err);
+			cfgerr++;
+		}
+		else if (!(px->lbprm.hash_candidates_expr->fetch->val & SMP_VAL_BE_SET_SRV)) {
+			ha_alert("%s '%s' [%s:%d]: error detected while parsing 'hash-candidates' expression '%s' "
+			         "which requires information from %s, which is not available here.\n",
+			         proxy_type_str(px), px->id,
+			         px->conf.file, px->conf.line,
+			         px->lbprm.hash_candidates_str, sample_src_names(px->lbprm.hash_candidates_expr->fetch->use));
+			cfgerr++;
+		}
+	}
+
 	/* only now we can check if some args remain unresolved.
 	 * This must be done after the users and groups resolution.
 	 */
@@ -2632,6 +2680,39 @@ int proxy_finalize(struct proxy *px, int *err_code)
 			if (px->lbprm.ops->proxy_init && px->lbprm.ops->proxy_init(px) < 0)
 				cfgerr++;
 			break;
+		}
+	}
+
+	/* hash-type rendezvous-subset is only wired into server selection for
+	 * "balance hash" (get_server_expr()/assign_server()'s no-sample
+	 * fallback in backend.c). The other hash inputs (source IP, URI, URL
+	 * parameter, header, RDP cookie) go through different call sites that
+	 * this hash-type does not hook into, so refuse them explicitly rather
+	 * than silently falling back to map-based hashing's unbounded
+	 * selection there.
+	 */
+	if ((px->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_RDVZ &&
+	    (px->lbprm.algo & BE_LB_ALGO) != BE_LB_ALGO_SMP) {
+		ha_alert("%s '%s' [%s:%d]: 'hash-type rendezvous-subset' is only supported with 'balance hash'.\n",
+		         proxy_type_str(px), px->id, px->conf.file, px->conf.line);
+		cfgerr++;
+	}
+
+	/* hash-type rendezvous-subset's "at most Y servers, ever" guarantee
+	 * only holds over a single, uniform ranking domain: there is no
+	 * active/backup mixing policy here, backup servers are refused
+	 * outright rather than silently reintroducing the kind of
+	 * conventional-backup fallback semantics this hash-type exists to
+	 * avoid (see rdvz_build_table() in lb_rdvz.c).
+	 */
+	if ((px->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_RDVZ) {
+		list_for_each_entry(newsrv, &px->servers, el_px) {
+			if (newsrv->flags & SRV_F_BACKUP) {
+				ha_alert("%s '%s' [%s:%d]: 'hash-type rendezvous-subset' does not support backup servers ('%s' is declared backup).\n",
+				         proxy_type_str(px), px->id, px->conf.file, px->conf.line, newsrv->id);
+				cfgerr++;
+				break;
+			}
 		}
 	}
 

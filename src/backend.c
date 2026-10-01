@@ -40,6 +40,7 @@
 #include <haproxy/lb_fwlc.h>
 #include <haproxy/lb_fwrr.h>
 #include <haproxy/lb_map.h>
+#include <haproxy/lb_rdvz.h>
 #include <haproxy/lb_ss.h>
 #include <haproxy/log.h>
 #include <haproxy/namespace.h>
@@ -562,6 +563,24 @@ struct server *get_server_expr(struct stream *s, const struct server *avoid)
 	hash = gen_hash(px, smp->data.u.str.area, smp->data.u.str.data);
 
  hash_done:
+	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_RDVZ) {
+		int y = px->lbprm.hash_candidates;
+
+		/* "hash-candidates" as a sample expression: resolve Y per
+		 * request. A fetch failure resolves to y=0, which
+		 * rdvz_get_server_hash() treats as "fail the request" -
+		 * same outcome as a hash-expression fetch failure above,
+		 * handled identically by the caller's no-sample fallback.
+		 */
+		if (px->lbprm.hash_candidates_expr) {
+			struct sample *ysmp;
+
+			ysmp = sample_fetch_as_type(px, s->sess, s, SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
+			                            px->lbprm.hash_candidates_expr, SMP_T_SINT);
+			y = ysmp ? (int)ysmp->data.u.sint : 0;
+		}
+		return rdvz_get_server_hash(px, hash, y, avoid);
+	}
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 		return chash_get_server_hash(px, hash, avoid);
 	else
@@ -729,6 +748,7 @@ int assign_server(struct stream *s)
 			srv = fwlc_get_next_server(s->be, prev_srv);
 			break;
 
+		case BE_LB_LKUP_RDVZ:
 		case BE_LB_LKUP_CHTREE:
 		case BE_LB_LKUP_MAP:
 			if ((s->be->lbprm.algo & BE_LB_KIND) == BE_LB_KIND_RR) {
@@ -816,9 +836,23 @@ int assign_server(struct stream *s)
 			}
 
 			/* If the hashing parameter was not found, let's fall
-			 * back to round robin on the map.
+			 * back to round robin on the map. rendezvous-subset
+			 * never falls back to an unbounded round robin here:
+			 * a NULL from get_server_expr() for this hash-type
+			 * means either the hash/Y sample expression couldn't
+			 * be evaluated, or <y> distinct candidates were
+			 * already exhausted on this stream's retries - both
+			 * are clean terminal conditions (see
+			 * rdvz_get_server_hash()'s contract), not a reason to
+			 * search outside the bounded candidate set. Map
+			 * straight to NOSRV so this never reaches the
+			 * backend-wide queue below either.
 			 */
 			if (!srv) {
+				if ((s->be->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_RDVZ) {
+					err = SRV_STATUS_NOSRV;
+					goto out;
+				}
 				if ((s->be->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 					srv = chash_get_next_server(s->be, prev_srv);
 				else

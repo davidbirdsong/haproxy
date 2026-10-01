@@ -52,7 +52,8 @@ static const char *common_kw_list[] = {
 	"stick-table", "stick", "stats", "option", "default_backend",
 	"http-reuse", "monitor", "transparent", "maxconn", "backlog",
 	"fullconn", "dispatch", "balance", "hash-type",
-	"hash-balance-factor", "unique-id-format", "unique-id-header",
+	"hash-balance-factor", "hash-candidates", "hash-subset-mode",
+	"hash-threshold", "hash-decay", "unique-id-format", "unique-id-header",
 	"log-format", "log-format-sd", "log-tag", "log", "source", "usesrc",
 	"error-log-format",
 	NULL /* must be last */
@@ -2696,11 +2697,21 @@ stats_error_parsing:
 	else if (strcmp(args[0], "hash-type") == 0) { /* set hashing method */
 		/**
 		 * The syntax for hash-type config element is
-		 * hash-type {map-based|consistent} [[<algo>] avalanche]
+		 * hash-type {map-based|consistent|rendezvous-subset} [[<algo>] avalanche]
 		 *
 		 * The default hash function is sdbm for map-based and sdbm+avalanche for consistent.
 		 */
 		curproxy->lbprm.algo &= ~(BE_LB_HASH_TYPE | BE_LB_HASH_FUNC | BE_LB_HASH_MOD);
+
+		/* each "hash-type" line fully redefines the hashing config, including
+		 * the rendezvous-subset-only knobs below, so start from a clean slate.
+		 */
+		curproxy->lbprm.hash_subset_mode = BE_LB_HSM_NONE;
+		curproxy->lbprm.hash_threshold = 0;
+		curproxy->lbprm.hash_decay_kind = BE_LB_HDECAY_NONE;
+		curproxy->lbprm.hash_decay_rate = 0;
+		curproxy->lbprm.hash_candidates = 0;
+		ha_free(&curproxy->lbprm.hash_candidates_str);
 
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
@@ -2711,19 +2722,29 @@ stats_error_parsing:
 		else if (strcmp(args[1], "map-based") == 0) {	/* use map-based hashing */
 			curproxy->lbprm.algo |= BE_LB_HASH_MAP;
 		}
+		else if (strcmp(args[1], "rendezvous-subset") == 0) { /* use rendezvous hashing over a fixed top-Y subset */
+			curproxy->lbprm.algo |= BE_LB_HASH_RDVZ;
+		}
 		else if (strcmp(args[1], "avalanche") == 0) {
 			ha_alert("parsing [%s:%d] : experimental feature '%s %s' is not supported anymore, please use '%s map-based sdbm avalanche' instead.\n", file, linenum, args[0], args[1], args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
 		else {
-			ha_alert("parsing [%s:%d] : '%s' only supports 'consistent' and 'map-based'.\n", file, linenum, args[0]);
+			ha_alert("parsing [%s:%d] : '%s' only supports 'consistent', 'map-based' and 'rendezvous-subset'.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
 
 		/* set the hash function to use */
-		if (!*args[2]) {
+		if ((curproxy->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_RDVZ) {
+			if (*args[2]) {
+				ha_alert("parsing [%s:%d] : '%s rendezvous-subset' takes no further argument.\n", file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		}
+		else if (!*args[2]) {
 			/* the default algo is sdbm */
 			curproxy->lbprm.algo |= BE_LB_HFCN_SDBM;
 
@@ -2765,6 +2786,11 @@ stats_error_parsing:
 		}
 	}
 	else if (strcmp(args[0], "hash-balance-factor") == 0) {
+		if ((curproxy->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_RDVZ) {
+			ha_alert("parsing [%s:%d] : '%s' is not compatible with 'hash-type rendezvous-subset'.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
 		if (*(args[1]) == 0) {
 			ha_alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -2776,6 +2802,130 @@ stats_error_parsing:
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
+	}
+	else if (strcmp(args[0], "hash-candidates") == 0) {
+		char *endp;
+		long value;
+
+		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
+			err_code |= ERR_WARN;
+
+		if ((curproxy->lbprm.algo & BE_LB_HASH_TYPE) != BE_LB_HASH_RDVZ) {
+			ha_alert("parsing [%s:%d] : '%s' only valid after 'hash-type rendezvous-subset'.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (*(args[1]) == 0) {
+			ha_alert("parsing [%s:%d] : '%s' expects an integer or a sample expression.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (alertif_too_many_args(1, file, linenum, args, &err_code))
+			goto out;
+
+		value = strtol(args[1], &endp, 0);
+		if (*endp == '\0') {
+			if (value <= 0) {
+				ha_alert("parsing [%s:%d] : '%s' count must be greater than 0.\n", file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			ha_free(&curproxy->lbprm.hash_candidates_str);
+			curproxy->lbprm.hash_candidates = value;
+		}
+		else {
+			curproxy->lbprm.hash_candidates = 0;
+			ha_free(&curproxy->lbprm.hash_candidates_str);
+			curproxy->lbprm.hash_candidates_str = strdup(args[1]);
+		}
+	}
+	else if (strcmp(args[0], "hash-subset-mode") == 0) {
+		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
+			err_code |= ERR_WARN;
+
+		if ((curproxy->lbprm.algo & BE_LB_HASH_TYPE) != BE_LB_HASH_RDVZ) {
+			ha_alert("parsing [%s:%d] : '%s' only valid after 'hash-type rendezvous-subset'.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (alertif_too_many_args(1, file, linenum, args, &err_code))
+			goto out;
+
+		if (strcmp(args[1], "leastconn") == 0)
+			curproxy->lbprm.hash_subset_mode = BE_LB_HSM_LEASTCONN;
+		else if (strcmp(args[1], "priority") == 0)
+			curproxy->lbprm.hash_subset_mode = BE_LB_HSM_PRIORITY;
+		else {
+			ha_alert("parsing [%s:%d] : '%s' only supports 'leastconn' and 'priority'.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+	}
+	else if (strcmp(args[0], "hash-threshold") == 0) {
+		char *endp;
+		long value;
+
+		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
+			err_code |= ERR_WARN;
+
+		if (curproxy->lbprm.hash_subset_mode != BE_LB_HSM_PRIORITY) {
+			ha_alert("parsing [%s:%d] : '%s' only valid after 'hash-subset-mode priority'.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (*(args[1]) == 0) {
+			ha_alert("parsing [%s:%d] : '%s' expects a percentage.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (alertif_too_many_args(1, file, linenum, args, &err_code))
+			goto out;
+
+		value = strtol(args[1], &endp, 0);
+		if (*endp != '\0' || value < 0 || value > 100) {
+			ha_alert("parsing [%s:%d] : '%s' expects an integer percentage between 0 and 100.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		curproxy->lbprm.hash_threshold = value;
+	}
+	else if (strcmp(args[0], "hash-decay") == 0) {
+		char *endp;
+		double rate;
+
+		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
+			err_code |= ERR_WARN;
+
+		if (curproxy->lbprm.hash_subset_mode != BE_LB_HSM_PRIORITY) {
+			ha_alert("parsing [%s:%d] : '%s' only valid after 'hash-subset-mode priority'.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (alertif_too_many_args(2, file, linenum, args, &err_code))
+			goto out;
+
+		if (strcmp(args[1], "geometric") == 0)
+			curproxy->lbprm.hash_decay_kind = BE_LB_HDECAY_GEOMETRIC;
+		else if (strcmp(args[1], "harmonic") == 0)
+			curproxy->lbprm.hash_decay_kind = BE_LB_HDECAY_HARMONIC;
+		else {
+			ha_alert("parsing [%s:%d] : '%s' only supports 'geometric' and 'harmonic'.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		if (*(args[2]) == 0) {
+			ha_alert("parsing [%s:%d] : '%s' expects a decay rate.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		rate = strtod(args[2], &endp);
+		if (*endp != '\0' || rate <= 0) {
+			ha_alert("parsing [%s:%d] : '%s' expects a decay rate as a positive number.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		curproxy->lbprm.hash_decay_rate = rate;
 	}
 	else if (strcmp(args[0], "unique-id-format") == 0) {
 		if (!*(args[1])) {

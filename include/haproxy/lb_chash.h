@@ -31,6 +31,13 @@ struct server;
 struct server *chash_get_next_server(struct proxy *p, struct server *srvtoavoid);
 struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const struct server *avoid);
 
+/* Computes the stable, health-independent per-server key derived from
+ * "hash-key" (id/addr/addr-port/guid). Shared with hash-type
+ * rendezvous-subset (see lb_rdvz.c), which depends on the same stability
+ * guarantee.
+ */
+u32 chash_compute_server_key(struct server *s);
+
 #endif /* _HAPROXY_LB_CHASH_H */
 
 /*

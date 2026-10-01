@@ -6237,7 +6237,11 @@ filter                                    -          X         X         X
 fullconn                                  X          -         X         X
 guid                                      -          X         X         X
 hash-balance-factor                       X          -         X         X
+hash-candidates                           X          -         X         X
+hash-decay                                X          -         X         X
 hash-preserve-affinity                    X          -         X         X
+hash-subset-mode                          X          -         X         X
+hash-threshold                            X          -         X         X
 hash-type                                 X          -         X         X
 http-after-response                       X (!)      X         X         X
 http-check comment                        X          -         X         X
@@ -8366,7 +8370,97 @@ hash-balance-factor <factor>
   This setting is also used by "balance random" which internally relies on the
   consistent hashing mechanism.
 
+  Cannot be used together with "hash-type rendezvous-subset", which has its
+  own, incompatible per-candidate selection logic (see "hash-subset-mode");
+  this is a configuration error.
+
   See also : "balance" and "hash-type".
+
+hash-candidates <count> | <sample-expr>
+  Specify the number of top-ranked candidate servers ("Y") bound to each hash
+  key under "hash-type rendezvous-subset"
+
+  May be used in the following contexts: tcp, http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    no    |   yes  |   yes
+
+  Arguments :
+    <count>        a literal positive integer giving Y directly. Must be
+                   greater than 0.
+
+    <sample-expr>  a sample expression evaluated once per request to resolve
+                   Y dynamically, for example a per-tenant quota looked up
+                   from a stick-table or a map(). It must resolve to an
+                   integer; if it does not, or resolves to a value of 0 or
+                   less, the request fails with no server assigned, the same
+                   as if the hash key itself could not be computed (see
+                   "hash-type").
+
+  Only valid directly after "hash-type rendezvous-subset"; it is a parse-time
+  error otherwise. The resulting Y is clamped to the number of configured
+  servers if it exceeds it. The Y servers are always the ones that currently
+  rank highest for the request's hash key, independently of their health or
+  load -- see "hash-type" for the complete invariant this depends on.
+
+  Using a sample expression only guarantees *per-request* containment. A
+  tenant-stable guarantee additionally requires Y itself to be stable per
+  tenant and to come from a trusted source (an authenticated claim, a
+  map()/stick-table lookup, or a variable set under a controlled ACL) --
+  never raw client input, which could be used to defeat the containment
+  guarantee directly.
+
+  Warning: once all Y servers bound to a given key are unavailable, the
+  request fails outright (no server assigned, 503) -- this hash-type never
+  searches outside the key's own Y, no matter how many other healthy
+  servers exist elsewhere in the backend. Adding servers to the backend
+  does not reliably help an already-affected key: a newly added server
+  only becomes one of that key's Y if it happens to rank there, which
+  cannot be targeted or predicted. Size Y with this in mind, the same way
+  you would size any other redundancy budget: large enough that Y specific
+  servers failing at once is acceptably rare for your availability target.
+  See management.txt, section 9.6, for the full operational discussion,
+  including sizing guidance for maintenance windows.
+
+  See also : "hash-type", "hash-subset-mode"
+
+hash-decay { geometric | harmonic } <rate>
+  Specify how the per-rank acceptance threshold decays for "hash-subset-mode
+  priority"
+
+  May be used in the following contexts: tcp, http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    no    |   yes  |   yes
+
+  Arguments :
+    geometric | harmonic  selects the shape of the decay, see below.
+
+    <rate>                a positive floating-point number controlling how
+                          aggressively the threshold falls off with rank. Its
+                          effect depends on which shape was chosen.
+
+  Writing t(i) for the acceptance threshold at rank i (i=0 is rank 1, the
+  best-ranked candidate for the request's hash key) and h for the value of
+  "hash-threshold" :
+
+    - "geometric" decays multiplicatively:  t(i) = h * rate^i
+                  A <rate> below 1 makes the threshold fall off fast: with
+                  rate 0.5, the acceptance chance is halved at every
+                  subsequent rank. A <rate> of 1 disables decay entirely
+                  (every rank gets the same threshold as rank 1).
+
+    - "harmonic" decays sub-exponentially:  t(i) = h / (1 + rate * i)
+                 This falls off much more gently than "geometric" for the
+                 same <rate>: with rate 0.5, rank 2's threshold is still two
+                 thirds of rank 1's. Useful when some baseline traffic should
+                 still reach ranks 2 and 3 even while rank 1 is perfectly
+                 healthy, rather than an almost-always-rank-1 pattern.
+
+  Only valid after "hash-subset-mode priority"; it is a parse-time error
+  otherwise.
+
+  See also : "hash-type", "hash-subset-mode", "hash-threshold"
 
 hash-preserve-affinity { always | maxconn | maxqueue }
   Specify a method for assigning streams to servers with hash load balancing
@@ -8396,7 +8490,71 @@ hash-preserve-affinity { always | maxconn | maxqueue }
                    picked by following the hashing ring. This has no effect on
                    servers that do not set both "maxconn" and "maxqueue".
 
+  Cannot be used together with "hash-type rendezvous-subset", which has its
+  own, incompatible per-candidate selection logic (see "hash-subset-mode");
+  this is a configuration error.
+
   See also : "maxconn", "maxqueue", "hash-balance-factor"
+
+hash-subset-mode { leastconn | priority }
+  Specify the rule used to pick a server within the Y-sized candidate set of
+  "hash-type rendezvous-subset"
+
+  May be used in the following contexts: tcp, http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    no    |   yes  |   yes
+
+  The following values can be specified:
+
+    - "leastconn" : a weighted argmin over the Y candidates: the candidate
+                      with the lowest current load (connections in progress
+                      plus any already queued for it, scaled by its weight)
+                      is preferred. If every candidate is saturated (at
+                      "maxconn"), the request is still assigned to whichever
+                      of the Y is the overall argmin, so that the normal
+                      per-server admission path queues it; including queued
+                      requests in the load keeps this choice meaningful past
+                      the point where every candidate is pinned at "maxconn"
+                      and only queue depth still tells them apart. A down or
+                      drained candidate is never picked, not even as that
+                      fallback.
+
+    - "priority"    : a rank-biased random walk over the Y candidates,
+                      best-to-worst by hash rank. At each rank, a uniform
+                      random roll is compared against an acceptance threshold
+                      that decays by rank (see "hash-threshold" and
+                      "hash-decay"); the first healthy, unsaturated candidate
+                      whose roll succeeds is used. If no rank is accepted,
+                      the request falls back to the best-ranked candidate
+                      that is at least usable (healthy, though possibly
+                      saturated). A down or drained candidate is never
+                      picked, not even as that fallback.
+
+  Only valid directly after "hash-type rendezvous-subset"; it is a parse-time
+  error otherwise. "hash-threshold" and "hash-decay" are themselves only
+  accepted after "hash-subset-mode priority".
+
+  See also : "hash-type", "hash-candidates", "hash-threshold", "hash-decay"
+
+hash-threshold <percent>
+  Specify the rank-1 acceptance probability for "hash-subset-mode priority"
+
+  May be used in the following contexts: tcp, http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    no    |   yes  |   yes
+
+  Arguments :
+    <percent> an integer between 0 and 100: the percentage chance that the
+              best-ranked (rank 1) candidate is accepted on its own roll,
+              before any decay is applied. Subsequent ranks use this same
+              value as the starting point for "hash-decay"'s formula.
+
+  Only valid after "hash-subset-mode priority"; it is a parse-time error
+  otherwise.
+
+  See also : "hash-type", "hash-subset-mode", "hash-decay"
 
 hash-type <method> <function> <modifier>
   Specify a method to use for mapping hashes to servers
@@ -8437,7 +8595,43 @@ hash-type <method> <function> <modifier>
                   same IDs. Note: consistent hash uses sdbm and avalanche if no
                   hash function is specified.
 
-    <function> is the hash function to be used :
+      rendezvous-subset  unlike the two methods above, which map a hash key
+                  to a single server, this binds each hash key to a small,
+                  fixed *subset* of up to "hash-candidates" servers (Y), and
+                  "hash-subset-mode" picks the actual server from only that
+                  subset. The ranking (which Y servers a given key is bound
+                  to) is computed via weighted rendezvous (HRW) hashing over
+                  every configured server, fresh on every request, and never
+                  depends on health or load -- health and load are only ever
+                  used to choose among the already-fixed Y candidates, never
+                  to extend past them. This is the key difference from
+                  "consistent": a capped ring walk still changes its
+                  candidate set when a ring-adjacent server goes down (the
+                  servers physically leave the ring), while this hash-type's
+                  candidate set for a given key never changes due to any
+                  server outside that key's own Y -- which also means that,
+                  unlike every other method on this page, once all Y of a
+                  key's servers are unavailable the request fails outright
+                  rather than falling back to some other server elsewhere in
+                  the backend (see "hash-candidates" for sizing guidance).
+                  See management.txt, section 9.6 ("Multi-tenant backends
+                  and blast-radius containment") for why and when to use
+                  this. Backup servers
+                  are not supported and are rejected outright, whether
+                  declared at config time or added at runtime: there is no
+                  mixing policy to decide if or when one would ever be a
+                  candidate. Runtime "add server"/"del server" are otherwise
+                  fully supported for non-backup servers. Requires "balance
+                  hash"; selecting it under any other "balance" mode is a
+                  configuration error. Takes no <function> or <modifier>
+                  (below) and no further arguments: it uses a fixed internal
+                  hash combine which is not configurable in this release.
+                  Requires "hash-candidates" and "hash-subset-mode" to also
+                  be set; "hash-balance-factor" and "hash-preserve-affinity"
+                  cannot be used with it.
+
+    <function> is the hash function to be used (map-based and consistent
+               only; rendezvous-subset does not use this) :
 
        sdbm   this function was created initially for sdbm (a public-domain
               reimplementation of ndbm) database library. It was found to do
@@ -8474,7 +8668,9 @@ hash-type <method> <function> <modifier>
               an integer whose value will be used as the key. Some input key
               types might not be relevant here (e.g. IP addresses).
 
-    <modifier> indicates an optional method applied after hashing the key :
+    <modifier> indicates an optional method applied after hashing the key
+               (map-based and consistent only; rendezvous-subset does not use
+               this) :
 
        avalanche   This directive indicates that the result from the hash
                    function above should not be used in its raw form but that
@@ -8494,7 +8690,8 @@ hash-type <method> <function> <modifier>
   the range of the values being hashed.
 
   See also : "balance", "hash-balance-factor", "hash-preserve-affinity",
-             "server"
+             "hash-candidates", "hash-subset-mode", "hash-threshold",
+             "hash-decay", "server"
 
 http-after-response <action> <options...> [ { if | unless } <condition> ]
   Access control for all Layer 7 responses (server, applet/service and internal

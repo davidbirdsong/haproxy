@@ -6663,6 +6663,21 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	if (errcode)
 		goto out;
 
+	/* hash-type rendezvous-subset refuses backup servers outright (see
+	 * check_config_validity() in proxy.c): there is no active/backup
+	 * mixing policy to decide whether this one would ever be a
+	 * candidate. "backup" isn't known until the keyword loop above has
+	 * run, so this can't be checked earlier alongside
+	 * be_supports_dynamic_srv() (which only gates dynamic add on the
+	 * algo in general - rendezvous-subset itself does support it, see
+	 * BE_LB_PROP_DYN on lb_rdvz_ops).
+	 */
+	if ((srv->flags & SRV_F_BACKUP) &&
+	    (be->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_RDVZ) {
+		ha_alert("'hash-type rendezvous-subset' does not support backup servers.\n");
+		goto out;
+	}
+
 	/* A dynamic server does not currently support resolution.
 	 *
 	 * Initialize it explicitly to the "none" method to ensure no

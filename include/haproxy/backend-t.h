@@ -28,6 +28,7 @@
 #include <haproxy/lb_fwlc-t.h>
 #include <haproxy/lb_fwrr-t.h>
 #include <haproxy/lb_map-t.h>
+#include <haproxy/lb_rdvz-t.h>
 #include <haproxy/lb_ss-t.h>
 #include <haproxy/server-t.h>
 #include <haproxy/thread-t.h>
@@ -109,6 +110,7 @@
 #define BE_LB_LKUP_LCTREE 0x00300000  /* FWLC tree lookup */
 #define BE_LB_LKUP_CHTREE 0x00400000  /* consistent hash  */
 #define BE_LB_LKUP_FSTREE 0x00500000  /* FAS tree lookup */
+#define BE_LB_LKUP_RDVZ   0x00600000  /* rendezvous-subset HRW lookup */
 #define BE_LB_LKUP        0x00700000  /* mask to get just the LKUP value */
 
 /* additional properties */
@@ -117,7 +119,23 @@
 /* hash types */
 #define BE_LB_HASH_MAP    0x00000000 /* map-based hash (default) */
 #define BE_LB_HASH_CONS   0x01000000 /* consistent hashbit to indicate a dynamic algorithm */
-#define BE_LB_HASH_TYPE   0x01000000 /* get/clear hash types */
+#define BE_LB_HASH_RDVZ   0x20000000 /* rendezvous-subset hash: fixed top-Y candidate set */
+#define BE_LB_HASH_TYPE   0x21000000 /* get/clear hash types */
+
+/* BE_LB_HSM_* is the rule used to pick a server within the rendezvous-subset
+ * top-Y candidate set ("hash-subset-mode"). Only meaningful when
+ * BE_LB_HASH_TYPE == BE_LB_HASH_RDVZ.
+ */
+#define BE_LB_HSM_NONE       0 /* not set */
+#define BE_LB_HSM_LEASTCONN  1 /* hash-subset-mode leastconn */
+#define BE_LB_HSM_PRIORITY   2 /* hash-subset-mode priority */
+
+/* BE_LB_HDECAY_* is the decay function used by "hash-decay". Only
+ * meaningful when hash_subset_mode == BE_LB_HSM_PRIORITY.
+ */
+#define BE_LB_HDECAY_NONE      0 /* not set */
+#define BE_LB_HDECAY_GEOMETRIC 1 /* hash-decay geometric */
+#define BE_LB_HDECAY_HARMONIC  2 /* hash-decay harmonic */
 
 /* additional modifier on top of the hash function (only avalanche right now) */
 #define BE_LB_HMOD_AVAL   0x02000000  /* avalanche modifier */
@@ -183,6 +201,7 @@ struct lbprm {
 		struct lb_chash chash;
 		struct lb_fas fas;
 		struct lb_ss ss;
+		struct lb_rdvz rdvz;
 	};
 	uint32_t algo;			/* load balancing algorithm and variants: BE_LB_* */
 	int tot_wact, tot_wbck;		/* total effective weights of active and backup servers */
@@ -192,6 +211,13 @@ struct lbprm {
 	int wmult;			/* ratio between user weight and effective weight */
 	int wdiv;			/* ratio between effective weight and user weight */
 	int hash_balance_factor;	/* load balancing factor * 100, 0 if disabled */
+	int hash_candidates;		/* "hash-candidates" Y as a literal count; 0 if unset or expr-based */
+	char *hash_candidates_str;	/* raw "hash-candidates" text when given as a sample expression */
+	struct sample_expr *hash_candidates_expr; /* compiled "hash-candidates" sample expression */
+	int hash_subset_mode;		/* BE_LB_HSM_*, hash-type rendezvous-subset only */
+	int hash_threshold;		/* percent, hash-subset-mode priority only */
+	int hash_decay_kind;		/* BE_LB_HDECAY_*, hash-subset-mode priority only */
+	double hash_decay_rate;	/* hash-subset-mode priority only */
 	unsigned int lb_free_list_nb;   /* Number of elements in the free list */
 	struct sample_expr *expr;       /* sample expression for "balance (log-)hash" */
 	char *arg_str;			/* name of the URL parameter/header/cookie used for hashing */
