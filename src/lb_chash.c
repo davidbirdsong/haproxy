@@ -80,7 +80,7 @@ static inline u32 chash_compute_node_key(struct server *s, unsigned node_index)
  * configured with `hash-key id` (the default) then the key will be determined
  * from the server's puid.
  */
-static inline u32 chash_compute_server_key(struct server *s)
+u32 chash_compute_server_key(struct server *s)
 {
 	enum srv_hash_key hash_key = s->hash_key;
 	struct server_inetaddr srv_addr;

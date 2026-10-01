@@ -33,6 +33,7 @@ Summary
 9.4.      Master CLI
 9.4.1.    Master CLI commands
 9.5.      Stats-file
+9.6.      Multi-tenant backends and blast-radius containment
 10.   Tricks for easier configuration management
 11.   Well-known traps to avoid
 12.   Debugging and performance issues
@@ -1811,6 +1812,9 @@ add server <backend>/<server> [args]*
   restriction is put on the backend which must used a dynamic load-balancing
   algorithm. A subset of keywords from the server config file statement can be
   used to configure the server behavior (see "add server help" to list them).
+  "hash-type rendezvous-subset" is one such algorithm, well-suited to scaling
+  a multi-tenant backend without reshuffling unrelated tenants (see section
+  9.6, "Multi-tenant backends and blast-radius containment").
 
   By default, 'default-server' is ignored by a dynamically created server.
   However, it is possible to use the 'from' server positional keyword to
@@ -4989,6 +4993,120 @@ of the stats-file is internally defined and freely subject to future changes
 and extension. It is designed to be compatible at least across adjacent
 haproxy stable branch releases, but may require optional extra configuration
 when loading a stats-file to a process running on an older version.
+
+
+9.6. Multi-tenant backends and blast-radius containment
+--------------------------------------------------------
+
+Multi-tenant backends in large, frequently-scaled clusters face a recurring
+operational problem: whichever hashing method distributes a tenant's traffic
+across the backend, growing or shrinking that backend (adding capacity,
+retiring a node, recovering from a failure) tends to reshuffle which servers
+each tenant lands on. For a cache-affinity use case this just costs some warm
+cache misses; for a use case where isolation matters -- noisy-neighbor
+containment, per-tenant blast-radius limits, compliance boundaries -- an
+uncontrolled reshuffle can mean a tenant's traffic temporarily (or, depending
+on the algorithm, permanently) reaching a server it was never meant to use.
+
+"hash-type rendezvous-subset" (see the "hash-type" keyword in
+configuration.txt) addresses this directly: each hash key (typically a
+tenant identifier) is bound to a small, fixed subset of "hash-candidates"
+servers out of the whole configured server list, and that subset is computed
+purely from server identity -- it never changes because some other, unrelated
+server elsewhere in the backend went up, went down, or got added or removed.
+Scaling the backend, whether via "add server"/"del server" (see section 9.3
+above) or via a config reload, only ever changes the ranking for tenants
+whose subset genuinely includes the server being added or removed; every
+other tenant's subset is completely unaffected.
+
+This makes it a good fit for operating a backend where:
+
+  - Tenants (or any other hashed key) must never receive traffic from a
+    server outside a small, bounded set, regardless of what else happens to
+    the backend. Consistent hashing's ring walk cannot make this guarantee:
+    a server going down physically removes it from the ring and silently
+    falls through to the next ring-adjacent server, which may not be in the
+    tenant's originally intended set.
+  - The backend is expected to grow and shrink regularly (autoscaling,
+    canary rollouts, maintenance rotations), and reshuffling unrelated
+    tenants' server assignments on every such change is undesirable.
+  - The number of servers a given tenant may ever use (Y) needs to be
+    tunable per tenant, e.g. from a stick-table or map lookup (see
+    "hash-candidates" in configuration.txt).
+
+Warning: this is a deliberate, significant departure from every other
+HAProxy load-balancing method. Normally, HAProxy only refuses a request
+when the entire backend has no viable server; as long as one server
+anywhere in the backend is healthy, every client can still be served.
+"hash-type rendezvous-subset" does not work this way: a request fails (no
+server assigned, HTTP 503) as soon as a given key's own Y candidates are
+all unavailable, even if every other server in the backend -- outside that
+key's Y -- is perfectly healthy and idle. This is not a limitation to be
+worked around, it is the direct consequence of the isolation guarantee this
+hash-type exists to provide: a backend that silently reached past a key's Y
+to find some server, any server, would no longer be bounding that key's
+blast radius at all.
+
+One consequence operators should plan for explicitly: adding servers to the
+backend does not reliably rescue a key that is already affected. A newly
+added server only becomes a candidate for a given key if it happens to rank
+inside that key's top Y under the hash-type's ranking, which cannot be
+targeted or predicted, and most keys' existing Y membership will not
+include it at all. Scaling up capacity in response to an incident -- the
+usual first response with every other load-balancing method here -- is not
+a dependable fix once a key's own Y has already failed.
+
+The two levers that actually matter are sizing Y adequately up front, and,
+if "hash-candidates" is sourced from a map or stick-table rather than a
+fixed literal, being willing to raise it temporarily during risky
+operations. Size Y the same way you would size any other redundancy
+budget: large enough that the simultaneous unavailability of Y specific
+servers is acceptably rare for your availability target, given your
+expected failure rate and recovery time. During a rolling deploy, or any
+other maintenance window where several servers may become briefly
+unavailable in close succession, consider raising the floor on Y for its
+duration: a larger Y widens every key's candidate set, reducing the chance
+that a rolling disruption happens to take out an entire key's membership at
+once, at the cost of temporarily loosening that key's isolation guarantee
+for the duration of the change. Because Y is resolved fresh on every
+request, raising it via a map or stick-table update takes effect
+immediately, with no reload required; a literal "hash-candidates" count
+requires a configuration change to adjust.
+
+When both "balance hash" and "hash-candidates" are expressions deriving from
+the same request (for example, a tenant identifier used as the hash key, and
+that same tenant's permitted Y looked up from a map), capture the identifier
+once with "http-request set-var" and reference that variable from both
+directives, rather than letting each directive independently re-extract and
+re-normalize the raw header or parameter. HAProxy cannot enforce this for
+you: the two expressions are evaluated completely independently on every
+request, so they can silently drift apart if, say, a trimming or
+case-folding converter is added to one expression's chain but not the
+other's. The practical failure mode is a single tenant effectively split in
+two: one normalization hashes it into one subset of servers, while the
+other's differently-normalized value looks up a different (or missing) Y,
+defeating the isolation guarantee this hash-type exists to provide. For
+example:
+
+  http-request set-var(txn.tenant) req.hdr(X-Tenant)
+  ...
+  balance hash var(txn.tenant)
+  hash-candidates var(txn.tenant),map_int(tenant_y.map,3)
+
+If tenant identifiers are case-sensitive, do not add a case-folding
+converter to this capture (or to either directive) at all: "Acme" and "acme"
+must resolve to distinct subsets, not be collapsed into one.
+
+Backup servers are not supported with this hash-type and are rejected both
+at config time and by "add server" (see section 9.3 above): there is no
+backup-mixing policy, since every option considered either reopens the
+health-dependent drift this hash-type exists to avoid, or adds complexity
+for a conventional-backup use case that fits poorly with the kind of large,
+horizontally-scaled clusters this feature targets.
+
+See the "hash-type", "hash-candidates", "hash-subset-mode", "hash-threshold"
+and "hash-decay" keywords in configuration.txt for the exact configuration
+syntax.
 
 
 10. Tricks for easier configuration management
