@@ -1422,6 +1422,12 @@ static int proxy_parse_balance(char **args, int section_type, struct proxy *curp
 		 */
 		curpx->lbprm.algo &= ~(BE_LB_HASH_TYPE | BE_LB_HASH_FUNC | BE_LB_HASH_MOD);
 
+		/* each "hash-type" line fully redefines the hashing config,
+		 * so start "hash-candidates" from a clean slate too.
+		 */
+		curpx->lbprm.hash_candidates = 0;
+		ha_free(&curpx->lbprm.hash_candidates_str);
+
 		if (strcmp(args[1], "consistent") == 0) {	/* use consistent hashing */
 			curpx->lbprm.algo |= BE_LB_HASH_CONS;
 		}
@@ -1486,15 +1492,38 @@ static int proxy_parse_balance(char **args, int section_type, struct proxy *curp
 		}
 	}
 	else if (strcmp(args[0], "hash-candidates") == 0) {
+		char *endp;
+		long value;
+
 		if (*(args[1]) == 0) {
-			memprintf(err, "'%s' expects an integer argument.", args[0]);
+			memprintf(err, "'%s' expects an integer or a sample expression.", args[0]);
 			return -1;
 		}
-
-		curpx->lbprm.hash_candidates = atoi(args[1]);
-		if (curpx->lbprm.hash_candidates < 0) {
-			memprintf(err, "'%s' must be 0 (disabled) or greater.", args[0]);
+		if (too_many_args(1, args, err, NULL))
 			return -1;
+
+		value = strtol(args[1], &endp, 0);
+		if (*endp == '\0') {
+			if (value < 0) {
+				memprintf(err, "'%s' must be 0 (disabled) or greater.", args[0]);
+				return -1;
+			}
+			ha_free(&curpx->lbprm.hash_candidates_str);
+			curpx->lbprm.hash_candidates = value;
+		}
+		else {
+			/* a sample expression is resolved once per request; only
+			 * meaningful where a per-request candidate-pool cap applies
+			 * (currently hash-type consistent's ring walk).
+			 */
+			if ((curpx->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_MAP) {
+				memprintf(err, "'%s' only supports a sample expression with "
+				               "'hash-type consistent'.", args[0]);
+				return -1;
+			}
+			curpx->lbprm.hash_candidates = 0;
+			ha_free(&curpx->lbprm.hash_candidates_str);
+			curpx->lbprm.hash_candidates_str = strdup(args[1]);
 		}
 	}
 	else {

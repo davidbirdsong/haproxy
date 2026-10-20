@@ -29,7 +29,8 @@
 struct proxy;
 struct server;
 struct server *chash_get_next_server(struct proxy *p, struct server *srvtoavoid);
-struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const struct server *avoid);
+struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const struct server *avoid,
+                                     int candidates);
 
 #endif /* _HAPROXY_LB_CHASH_H */
 
