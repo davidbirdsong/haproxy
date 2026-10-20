@@ -260,6 +260,7 @@ static inline void proxy_free_common(struct proxy *px)
 	ha_free(&px->cookie_domain);
 	ha_free(&px->cookie_attrs);
 	ha_free(&px->lbprm.arg_str);
+	ha_free(&px->lbprm.hash_candidates_str);
 	ha_free(&px->capture_name);
 	istfree(&px->monitor_uri);
 	ha_free(&px->conn_src.iface_name);
@@ -333,6 +334,7 @@ void deinit_proxy(struct proxy *p)
 
 	/* regular proxy specific cleanup */
 	release_sample_expr(p->lbprm.expr);
+	release_sample_expr(p->lbprm.hash_candidates_expr);
 	free(p->server_state_file_name);
 	free(p->invalid_rep);
 	free(p->invalid_req);
@@ -2457,6 +2459,41 @@ int proxy_finalize(struct proxy *px, int *err_code)
 			px->http_needed |= !!(px->lbprm.expr->fetch->use & SMP_USE_HTTP_ANY);
 	}
 
+	/* "hash-candidates" needs to compile its expression when a non-integer
+	 * value was given at parse time (a literal count needs no compilation).
+	 */
+	if (px->lbprm.hash_candidates_str) {
+		int idx = 0;
+		const char *args[] = {
+			px->lbprm.hash_candidates_str,
+			NULL,
+		};
+
+		err = NULL;
+		px->conf.args.ctx = ARGC_USRV; // same context as use_server.
+		px->lbprm.hash_candidates_expr =
+			sample_parse_expr((char **)args, &idx,
+					  px->conf.file, px->conf.line,
+					  &err, &px->conf.args, NULL);
+
+		if (!px->lbprm.hash_candidates_expr) {
+			ha_alert("%s '%s' [%s:%d]: failed to parse 'hash-candidates' expression '%s' in : %s.\n",
+			         proxy_type_str(px), px->id,
+			         px->conf.file, px->conf.line,
+			         px->lbprm.hash_candidates_str, err);
+			ha_free(&err);
+			cfgerr++;
+		}
+		else if (!(px->lbprm.hash_candidates_expr->fetch->val & SMP_VAL_BE_SET_SRV)) {
+			ha_alert("%s '%s' [%s:%d]: error detected while parsing 'hash-candidates' expression '%s' "
+			         "which requires information from %s, which is not available here.\n",
+			         proxy_type_str(px), px->id,
+			         px->conf.file, px->conf.line,
+			         px->lbprm.hash_candidates_str, sample_src_names(px->lbprm.hash_candidates_expr->fetch->use));
+			cfgerr++;
+		}
+	}
+
 	/* only now we can check if some args remain unresolved.
 	 * This must be done after the users and groups resolution.
 	 */
@@ -3470,6 +3507,8 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 		if (defproxy->lbprm.arg_str)
 			curproxy->lbprm.arg_str = strdup(defproxy->lbprm.arg_str);
 		curproxy->lbprm.arg_len  = defproxy->lbprm.arg_len;
+		if (defproxy->lbprm.hash_candidates_str)
+			curproxy->lbprm.hash_candidates_str = strdup(defproxy->lbprm.hash_candidates_str);
 		curproxy->lbprm.arg_opt1 = defproxy->lbprm.arg_opt1;
 		curproxy->lbprm.arg_opt2 = defproxy->lbprm.arg_opt2;
 		curproxy->lbprm.arg_opt3 = defproxy->lbprm.arg_opt3;

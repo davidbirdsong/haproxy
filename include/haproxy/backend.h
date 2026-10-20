@@ -34,9 +34,9 @@ extern struct list lb_ops_list;
 
 void lb_ops_register(struct lb_ops *ops);
 
-struct server *get_server_sh(struct proxy *px, const char *addr, int len, const struct server *avoid);
-struct server *get_server_uh(struct proxy *px, char *uri, int uri_len, const struct server *avoid);
-struct server *get_server_ph(struct proxy *px, const char *uri, int uri_len, const struct server *avoid);
+struct server *get_server_sh(struct stream *s, const char *addr, int len, const struct server *avoid);
+struct server *get_server_uh(struct stream *s, char *uri, int uri_len, const struct server *avoid);
+struct server *get_server_ph(struct stream *s, const char *uri, int uri_len, const struct server *avoid);
 struct server *get_server_ph_post(struct stream *s, const struct server *avoid);
 struct server *get_server_hh(struct stream *s, const struct server *avoid);
 struct server *get_server_rch(struct stream *s, const struct server *avoid);

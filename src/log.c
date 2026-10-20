@@ -3071,7 +3071,11 @@ static inline void __do_send_log_backend(struct proxy *be, struct log_header hdr
 		unsigned int hash;
 
 		hash = statistical_prng(); /* random */
-		srv = chash_get_server_hash(be, hash, NULL);
+		/* "hash-candidates" doesn't apply to "balance random" (see backend.c's
+		 * get_server_rnd()), and there's no live stream here to resolve a
+		 * sample-expression form of it even if it did.
+		 */
+		srv = chash_get_server_hash(be, hash, NULL, 0);
 	}
 	else if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_LH) {
 		struct sample result;

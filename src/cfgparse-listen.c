@@ -2753,6 +2753,12 @@ stats_error_parsing:
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
+		/* each "hash-type" line fully redefines the hashing config,
+		 * so start "hash-candidates" from a clean slate too.
+		 */
+		curproxy->lbprm.hash_candidates = 0;
+		ha_free(&curproxy->lbprm.hash_candidates_str);
+
 		if (strcmp(args[1], "consistent") == 0) {	/* use consistent hashing */
 			curproxy->lbprm.algo |= BE_LB_HASH_CONS;
 		}
@@ -2826,17 +2832,40 @@ stats_error_parsing:
 		}
 	}
 	else if (strcmp(args[0], "hash-candidates") == 0) {
+		char *endp;
+		long value;
+
 		if (*(args[1]) == 0) {
-			ha_alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			ha_alert("parsing [%s:%d] : '%s' expects an integer or a sample expression.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-
-		curproxy->lbprm.hash_candidates = atoi(args[1]);
-		if (curproxy->lbprm.hash_candidates < 0) {
-			ha_alert("parsing [%s:%d] : '%s' must be 0 (disabled) or greater.\n", file, linenum, args[0]);
-			err_code |= ERR_ALERT | ERR_FATAL;
+		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
+
+		value = strtol(args[1], &endp, 0);
+		if (*endp == '\0') {
+			if (value < 0) {
+				ha_alert("parsing [%s:%d] : '%s' must be 0 (disabled) or greater.\n", file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			ha_free(&curproxy->lbprm.hash_candidates_str);
+			curproxy->lbprm.hash_candidates = value;
+		}
+		else {
+			/* a sample expression is resolved once per request; only
+			 * meaningful where a per-request candidate-pool cap applies
+			 * (currently hash-type consistent's ring walk).
+			 */
+			if ((curproxy->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_MAP) {
+				ha_alert("parsing [%s:%d] : '%s' only supports a sample expression with 'hash-type consistent'.\n", file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			curproxy->lbprm.hash_candidates = 0;
+			ha_free(&curproxy->lbprm.hash_candidates_str);
+			curproxy->lbprm.hash_candidates_str = strdup(args[1]);
 		}
 	}
 	else if (strcmp(args[0], "unique-id-format") == 0) {
