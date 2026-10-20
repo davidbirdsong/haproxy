@@ -1394,8 +1394,9 @@ static int proxy_parse_log_opts(char **args, int section_type, struct proxy *cur
 	return -1;
 }
 
-/* Parses the load-balancing keywords "balance", "hash-type" and
- * "hash-balance-factor", which all require the backend capability.
+/* Parses the load-balancing keywords "balance", "hash-type",
+ * "hash-balance-factor" and "hash-candidates", which all require the
+ * backend capability.
  */
 static int proxy_parse_balance(char **args, int section_type, struct proxy *curpx,
                                const struct proxy *defpx, const char *file, int line,
@@ -1481,6 +1482,18 @@ static int proxy_parse_balance(char **args, int section_type, struct proxy *curp
 		curpx->lbprm.hash_balance_factor = atol(args[1]);
 		if (curpx->lbprm.hash_balance_factor != 0 && curpx->lbprm.hash_balance_factor <= 100) {
 			memprintf(err, "'%s' must be 0 or greater than 100.", args[0]);
+			return -1;
+		}
+	}
+	else if (strcmp(args[0], "hash-candidates") == 0) {
+		if (*(args[1]) == 0) {
+			memprintf(err, "'%s' expects an integer argument.", args[0]);
+			return -1;
+		}
+
+		curpx->lbprm.hash_candidates = atoi(args[1]);
+		if (curpx->lbprm.hash_candidates < 0) {
+			memprintf(err, "'%s' must be 0 (disabled) or greater.", args[0]);
 			return -1;
 		}
 	}
@@ -3023,6 +3036,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_LISTEN, "fullconn", proxy_parse_conn_limits },
 	{ CFG_LISTEN, "grace", proxy_parse_removed_kw },
 	{ CFG_LISTEN, "hash-balance-factor", proxy_parse_balance },
+	{ CFG_LISTEN, "hash-candidates", proxy_parse_balance },
 	{ CFG_LISTEN, "hash-type", proxy_parse_balance },
 	{ CFG_LISTEN, "http-after-response", proxy_parse_http_rules },
 	{ CFG_LISTEN, "http-request", proxy_parse_http_rules },

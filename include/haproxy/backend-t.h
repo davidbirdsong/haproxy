@@ -192,6 +192,7 @@ struct lbprm {
 	int wmult;			/* ratio between user weight and effective weight */
 	int wdiv;			/* ratio between effective weight and user weight */
 	int hash_balance_factor;	/* load balancing factor * 100, 0 if disabled */
+	int hash_candidates;		/* max number of ring candidates tried per pick (incl. primary), 0 if disabled */
 	unsigned int lb_free_list_nb;   /* Number of elements in the free list */
 	struct sample_expr *expr;       /* sample expression for "balance (log-)hash" */
 	char *arg_str;			/* name of the URL parameter/header/cookie used for hashing */

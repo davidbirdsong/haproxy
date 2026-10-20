@@ -421,6 +421,7 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const s
 	unsigned int dn, dp;
 	int loop;
 	int hashafnty;
+	int cand_left; /* remaining candidates after the current one; <0 means unlimited */
 
 	HA_RWLOCK_RDLOCK(LBPRM_LOCK, &p->lbprm.lock);
 
@@ -468,15 +469,27 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const s
 	loop = 0;
 	hashafnty = p->options3 & PR_O3_HASHAFNTY_MASK;
 
+	/* hash-candidates caps how many servers (the primary one included) we're
+	 * willing to inspect before giving up on load-shaping and keeping
+	 * whichever one we're on. It only makes sense for actual hash-based
+	 * algorithms; "balance random" also goes through this function but
+	 * draws a fresh hash per candidate itself, so it's left unbounded here.
+	 */
+	cand_left = -1;
+	if ((p->lbprm.algo & BE_LB_KIND) == BE_LB_KIND_HI && p->lbprm.hash_candidates > 0)
+		cand_left = p->lbprm.hash_candidates - 1;
+
 	while (nsrv == avoid ||
-			(p->lbprm.hash_balance_factor && !chash_server_is_eligible(nsrv)) ||
-			(hashafnty == PR_O3_HASHAFNTY_MAXCONN &&
+			(cand_left && p->lbprm.hash_balance_factor && !chash_server_is_eligible(nsrv)) ||
+			(cand_left && hashafnty == PR_O3_HASHAFNTY_MAXCONN &&
 				nsrv->maxconn &&
 				nsrv->served >= srv_dynamic_maxconn(nsrv)) ||
-			(hashafnty == PR_O3_HASHAFNTY_MAXQUEUE &&
+			(cand_left && hashafnty == PR_O3_HASHAFNTY_MAXQUEUE &&
 				nsrv->maxconn &&
 				nsrv->maxqueue &&
 				nsrv->served + nsrv->queueslength >= srv_dynamic_maxconn(nsrv) + nsrv->maxqueue)) {
+		if (cand_left > 0)
+			cand_left--;
 		next = eb32_next(next);
 		if (!next) {
 			next = eb32_first(root);
