@@ -52,7 +52,7 @@ static const char *common_kw_list[] = {
 	"stick-table", "stick", "stats", "option", "default_backend",
 	"http-reuse", "monitor", "transparent", "maxconn", "backlog",
 	"fullconn", "dispatch", "balance", "hash-type",
-	"hash-balance-factor", "unique-id-format", "unique-id-header",
+	"hash-balance-factor", "hash-candidates", "unique-id-format", "unique-id-header",
 	"log-format", "log-format-sd", "log-tag", "log", "source", "usesrc",
 	"error-log-format",
 	NULL /* must be last */
@@ -2821,6 +2821,20 @@ stats_error_parsing:
 		curproxy->lbprm.hash_balance_factor = atol(args[1]);
 		if (curproxy->lbprm.hash_balance_factor != 0 && curproxy->lbprm.hash_balance_factor <= 100) {
 			ha_alert("parsing [%s:%d] : '%s' must be 0 or greater than 100.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+	}
+	else if (strcmp(args[0], "hash-candidates") == 0) {
+		if (*(args[1]) == 0) {
+			ha_alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		curproxy->lbprm.hash_candidates = atoi(args[1]);
+		if (curproxy->lbprm.hash_candidates < 0) {
+			ha_alert("parsing [%s:%d] : '%s' must be 0 (disabled) or greater.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}

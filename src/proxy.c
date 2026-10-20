@@ -3429,6 +3429,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	if (curproxy->cap & PR_CAP_BE) {
 		curproxy->lbprm.algo = defproxy->lbprm.algo;
 		curproxy->lbprm.hash_balance_factor = defproxy->lbprm.hash_balance_factor;
+		curproxy->lbprm.hash_candidates = defproxy->lbprm.hash_candidates;
 		curproxy->fullconn = defproxy->fullconn;
 		curproxy->conn_retries = defproxy->conn_retries;
 		curproxy->redispatch_after = defproxy->redispatch_after;
