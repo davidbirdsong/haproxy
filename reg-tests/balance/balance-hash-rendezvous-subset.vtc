@@ -1,0 +1,331 @@
+varnishtest "balance hash with hash-type rendezvous-subset"
+feature ignore_unknown_macro
+
+#
+# Config validation: each of the new keywords (hash-candidates,
+# hash-subset-mode, hash-threshold, hash-decay) requires its prerequisite
+# keyword to already be set on the same proxy, and hash-type
+# rendezvous-subset is restricted to "balance hash" with no backup servers.
+#
+
+haproxy h1 -conf-BAD {'hash-candidates' only valid after 'hash-type rendezvous-subset'.} {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+
+    backend be
+        balance roundrobin
+        hash-candidates 2
+        server s1 127.0.0.1:1
+}
+
+haproxy h2 -conf-BAD {'hash-subset-mode' only valid after 'hash-type rendezvous-subset'.} {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+
+    backend be
+        balance roundrobin
+        hash-subset-mode leastconn
+        server s1 127.0.0.1:1
+}
+
+haproxy h3 -conf-BAD {'hash-threshold' only valid after 'hash-subset-mode priority'.} {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+
+    backend be
+        balance hash req.hdr(X-Tenant)
+        hash-type rendezvous-subset
+        hash-candidates 2
+        hash-subset-mode leastconn
+        hash-threshold 50
+        server s1 127.0.0.1:1
+        server s2 127.0.0.1:1
+}
+
+haproxy h4 -conf-BAD {'hash-decay' only valid after 'hash-subset-mode priority'.} {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+
+    backend be
+        balance hash req.hdr(X-Tenant)
+        hash-type rendezvous-subset
+        hash-candidates 2
+        hash-subset-mode leastconn
+        hash-decay geometric 0.5
+        server s1 127.0.0.1:1
+        server s2 127.0.0.1:1
+}
+
+haproxy h5 -conf-BAD {'hash-type rendezvous-subset' is only supported with 'balance hash'.} {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+
+    backend be
+        balance roundrobin
+        hash-type rendezvous-subset
+        hash-candidates 2
+        hash-subset-mode leastconn
+        server s1 127.0.0.1:1
+        server s2 127.0.0.1:1
+}
+
+haproxy h6 -conf-BAD {'hash-type rendezvous-subset' does not support backup servers ('srvbak' is declared backup).} {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+
+    backend be
+        balance hash req.hdr(X-Tenant)
+        hash-type rendezvous-subset
+        hash-candidates 2
+        hash-subset-mode leastconn
+        server srv1 127.0.0.1:1
+        server srvbak 127.0.0.1:1 backup
+}
+
+haproxy h7 -conf-BAD {'hash-balance-factor' is not compatible with 'hash-type rendezvous-subset'.} {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+
+    backend be
+        balance hash req.hdr(X-Tenant)
+        hash-type rendezvous-subset
+        hash-balance-factor 150
+        server s1 127.0.0.1:1
+}
+
+haproxy h8 -conf-BAD {'hash-preserve-affinity' is not compatible with 'hash-type rendezvous-subset'} {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+
+    backend be
+        balance hash req.hdr(X-Tenant)
+        hash-type rendezvous-subset
+        hash-preserve-affinity maxconn
+        server s1 127.0.0.1:1
+}
+
+haproxy h9 -conf-OK {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+
+    backend be
+        balance hash req.hdr(X-Tenant)
+        hash-type rendezvous-subset
+        hash-candidates 2
+        hash-subset-mode priority
+        hash-threshold 50
+        hash-decay geometric 0.5
+        server s1 127.0.0.1:1
+        server s2 127.0.0.1:1
+}
+
+#
+# Functional: the bounded-subset / no-fallback guarantee.
+#
+# With 3 servers declared srv0, srv1, srv2 (in that order - haproxy's
+# default "hash-key id" static key is derived from declaration-order puid,
+# not from port or name) and hash-candidates 2, the tenant key below
+# ("vtc-tenant-1") was confirmed empirically (by observing, over the stats
+# socket, which server answers and in what order as each is put into
+# maintenance) to resolve its Y=2 HRW subset to {srv1, srv2}, ranked srv1
+# then srv2 - srv0 is never a candidate for this tenant. Re-derive this
+# mapping the same way if the server count/order below ever changes. This
+# is the central guarantee rendezvous-subset exists to provide: once every
+# candidate in that fixed, small subset is down, the request must fail
+# outright (503) rather than spilling onto any other healthy server in the
+# backend, however idle.
+#
+
+server s0 {
+    rxreq
+    txresp -hdr "Server: s0"
+} -start
+
+server s1 {
+    rxreq
+    txresp -hdr "Server: s1"
+} -start
+
+server s2 {
+    rxreq
+    txresp -hdr "Server: s2"
+} -start
+
+haproxy h10 -arg "-L A" -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout server "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    listen px
+        bind "fd@${px}"
+        balance hash req.hdr(X-Tenant)
+        hash-type rendezvous-subset
+        hash-candidates 2
+        hash-subset-mode leastconn
+
+        server srv0 ${s0_addr}:${s0_port}
+        server srv1 ${s1_addr}:${s1_port}
+        server srv2 ${s2_addr}:${s2_port}
+} -start
+
+client c1 -connect ${h10_px_sock} {
+    txreq -hdr "X-Tenant: vtc-tenant-1"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.Server ~ s1
+} -run
+
+haproxy h10 -cli {
+    send "set server px/srv1 state maint"
+    expect ~ ".*"
+}
+
+# srv1 (rank 1) is down: traffic must move to srv2 (rank 2), the other Y=2
+# candidate - never to srv0, which is healthy and idle but outside the
+# subset.
+client c2 -connect ${h10_px_sock} {
+    txreq -hdr "X-Tenant: vtc-tenant-1"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.Server ~ s2
+} -run
+
+haproxy h10 -cli {
+    send "set server px/srv2 state maint"
+    expect ~ ".*"
+}
+
+# Both Y=2 candidates are now down. srv0 is healthy and idle, but outside
+# the bounded subset for this tenant: the request must fail cleanly (503)
+# rather than silently spilling onto it.
+client c3 -connect ${h10_px_sock} {
+    txreq -hdr "X-Tenant: vtc-tenant-1"
+    rxresp
+    expect resp.status == 503
+} -run
+
+#
+# Functional: within the bounded subset, a merely-saturated (not down)
+# candidate is skipped in favor of the next one, same as any other backend -
+# rendezvous-subset only bounds *which* servers are eligible, not how load is
+# spread among them.
+#
+
+barrier b1 cond 2
+barrier b2 cond 2
+
+server s3 {
+    rxreq
+    txresp -hdr "Server: s3"
+} -start
+
+server s4 {
+    rxreq
+    barrier b1 sync
+    barrier b2 sync
+    txresp -hdr "Server: s4"
+} -start
+
+server s5 {
+    rxreq
+    barrier b2 sync
+    txresp -hdr "Server: s5"
+} -start
+
+haproxy h11 -arg "-L A" -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout server "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    listen px
+        bind "fd@${px}"
+        balance hash req.hdr(X-Tenant)
+        hash-type rendezvous-subset
+        hash-candidates 2
+        hash-subset-mode leastconn
+
+        server srv0 ${s3_addr}:${s3_port} maxconn 1
+        server srv1 ${s4_addr}:${s4_port} maxconn 1
+        server srv2 ${s5_addr}:${s5_port} maxconn 1
+} -start
+
+client c4 -connect ${h11_px_sock} {
+    txreq -hdr "X-Tenant: vtc-tenant-1"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.Server ~ s4
+} -start
+
+barrier b1 sync
+
+# srv1 is holding its one connection open (maxconn 1): the next request for
+# the same tenant must spread to srv2 (the other Y candidate), never queue
+# behind srv1 or spill onto srv0 (outside Y).
+client c5 -connect ${h11_px_sock} {
+    txreq -hdr "X-Tenant: vtc-tenant-1"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.Server ~ s5
+} -start
+
+client c4 -wait
+client c5 -wait

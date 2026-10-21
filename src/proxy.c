@@ -352,6 +352,12 @@ void deinit_proxy(struct proxy *p)
 	free(p->invalid_req);
 	if ((p->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_MAP)
 		free(p->lbprm.map.srv);
+	/* BE_LB_LKUP_RDVZ: no explicit free here - rdvz_server_deinit() (called
+	 * per-server, further down, via the generic p->lbprm.ops->server_deinit
+	 * loop over p->servers) already tears down p->lbprm.rdvz.tbl
+	 * progressively as each server is removed; freeing it here too would
+	 * race/double-free against that loop.
+	 */
 
 	list_for_each_entry_safe(cond, condb, &p->mon_fail_cond, list) {
 		LIST_DELETE(&cond->list);
@@ -1191,6 +1197,10 @@ proxy_parse_hash_preserve_affinity(char **args, int section, struct proxy *curpx
 	}
 	if (!(curpx->cap & PR_CAP_BE)) {
 		memprintf(err, "'%s' only available in backend or listen section", args[0]);
+		return -1;
+	}
+	if ((curpx->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_RDVZ) {
+		memprintf(err, "'%s' is not compatible with 'hash-type rendezvous-subset'", args[0]);
 		return -1;
 	}
 
@@ -2812,6 +2822,39 @@ int proxy_finalize(struct proxy *px, int *err_code)
 			if (px->lbprm.ops->proxy_init && px->lbprm.ops->proxy_init(px) < 0)
 				cfgerr++;
 			break;
+		}
+	}
+
+	/* hash-type rendezvous-subset is only wired into server selection for
+	 * "balance hash" (get_server_expr()/assign_server()'s no-sample
+	 * fallback in backend.c). The other hash inputs (source IP, URI, URL
+	 * parameter, header, RDP cookie) go through different call sites that
+	 * this hash-type does not hook into, so refuse them explicitly rather
+	 * than silently falling back to map-based hashing's unbounded
+	 * selection there.
+	 */
+	if ((px->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_RDVZ &&
+	    (px->lbprm.algo & BE_LB_ALGO) != BE_LB_ALGO_SMP) {
+		ha_alert("%s '%s' [%s:%d]: 'hash-type rendezvous-subset' is only supported with 'balance hash'.\n",
+		         proxy_type_str(px), px->id, px->conf.file, px->conf.line);
+		cfgerr++;
+	}
+
+	/* hash-type rendezvous-subset's "at most Y servers, ever" guarantee
+	 * only holds over a single, uniform ranking domain: there is no
+	 * active/backup mixing policy here, backup servers are refused
+	 * outright rather than silently reintroducing the kind of
+	 * conventional-backup fallback semantics this hash-type exists to
+	 * avoid (see rdvz_build_table() in lb_rdvz.c).
+	 */
+	if ((px->lbprm.algo & BE_LB_HASH_TYPE) == BE_LB_HASH_RDVZ) {
+		list_for_each_entry(newsrv, &px->servers, el_px) {
+			if (newsrv->flags & SRV_F_BACKUP) {
+				ha_alert("%s '%s' [%s:%d]: 'hash-type rendezvous-subset' does not support backup servers ('%s' is declared backup).\n",
+				         proxy_type_str(px), px->id, px->conf.file, px->conf.line, newsrv->id);
+				cfgerr++;
+				break;
+			}
 		}
 	}
 
