@@ -171,6 +171,28 @@ void update_backend_weight(struct proxy *px)
 	}
 }
 
+/* Resolves the "hash-candidates" value to use for a single pick against
+ * proxy <px>'s consistent-hash ring. "hash-candidates" may be configured as
+ * a literal (px->lbprm.hash_candidates) or a sample expression
+ * (px->lbprm.hash_candidates_expr), resolved once per request against
+ * <sess>/<strm>. A fetch failure or a non-positive result falls back to 0
+ * (disabled): a ring-walk cap has no "fail the request" state, 0 is always
+ * a well-defined, safe default.
+ */
+static inline int resolve_hash_candidates(struct proxy *px, struct session *sess, struct stream *strm)
+{
+	struct sample *smp;
+
+	if (!px->lbprm.hash_candidates_expr)
+		return px->lbprm.hash_candidates;
+
+	smp = sample_fetch_as_type(px, sess, strm, SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
+	                           px->lbprm.hash_candidates_expr, SMP_T_SINT);
+	if (!smp || smp->data.u.sint <= 0)
+		return 0;
+	return (int)smp->data.u.sint;
+}
+
 /*
  * This function tries to find a running server for the proxy <px> following
  * the source hash method. Depending on the number of active/backup servers,
@@ -178,8 +200,9 @@ void update_backend_weight(struct proxy *px)
  * If any server is found, it will be returned. If no valid server is found,
  * NULL is returned.
  */
-struct server *get_server_sh(struct proxy *px, const char *addr, int len, const struct server *avoid)
+struct server *get_server_sh(struct stream *s, const char *addr, int len, const struct server *avoid)
 {
+	struct proxy *px = s->be;
 	unsigned int h, l;
 
 	if (px->lbprm.tot_weight == 0)
@@ -203,7 +226,7 @@ struct server *get_server_sh(struct proxy *px, const char *addr, int len, const 
 		h = full_hash(h);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, h, avoid);
+		return chash_get_server_hash(px, h, avoid, resolve_hash_candidates(px, s->sess, s));
 	else
 		return map_get_server_hash(px, h);
 }
@@ -222,8 +245,9 @@ struct server *get_server_sh(struct proxy *px, const char *addr, int len, const 
  * algorithm out of a tens because it gave him the best results.
  *
  */
-struct server *get_server_uh(struct proxy *px, char *uri, int uri_len, const struct server *avoid)
+struct server *get_server_uh(struct stream *s, char *uri, int uri_len, const struct server *avoid)
 {
+	struct proxy *px = s->be;
 	unsigned int hash = 0;
 	int c;
 	int slashes = 0;
@@ -256,7 +280,7 @@ struct server *get_server_uh(struct proxy *px, char *uri, int uri_len, const str
 
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, hash, avoid);
+		return chash_get_server_hash(px, hash, avoid, resolve_hash_candidates(px, s->sess, s));
 	else
 		return map_get_server_hash(px, hash);
 }
@@ -270,8 +294,9 @@ struct server *get_server_uh(struct proxy *px, char *uri, int uri_len, const str
  * is returned. If any server is found, it will be returned. If no valid server
  * is found, NULL is returned.
  */
-struct server *get_server_ph(struct proxy *px, const char *uri, int uri_len, const struct server *avoid)
+struct server *get_server_ph(struct stream *s, const char *uri, int uri_len, const struct server *avoid)
 {
+	struct proxy *px = s->be;
 	unsigned int hash = 0;
 	const char *start, *end;
 	const char *p;
@@ -310,7 +335,7 @@ struct server *get_server_ph(struct proxy *px, const char *uri, int uri_len, con
 				hash = gen_hash(px, start, (end - start));
 
 				if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-					return chash_get_server_hash(px, hash, avoid);
+					return chash_get_server_hash(px, hash, avoid, resolve_hash_candidates(px, s->sess, s));
 				else
 					return map_get_server_hash(px, hash);
 			}
@@ -387,7 +412,7 @@ struct server *get_server_ph_post(struct stream *s, const struct server *avoid)
 				hash = gen_hash(px, start, (end - start));
 
 				if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-					return chash_get_server_hash(px, hash, avoid);
+					return chash_get_server_hash(px, hash, avoid, resolve_hash_candidates(px, s->sess, s));
 				else
 					return map_get_server_hash(px, hash);
 			}
@@ -481,7 +506,7 @@ struct server *get_server_hh(struct stream *s, const struct server *avoid)
 
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, hash, avoid);
+		return chash_get_server_hash(px, hash, avoid, resolve_hash_candidates(px, s->sess, s));
 	else
 		return map_get_server_hash(px, hash);
 }
@@ -524,7 +549,7 @@ struct server *get_server_rch(struct stream *s, const struct server *avoid)
 
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, hash, avoid);
+		return chash_get_server_hash(px, hash, avoid, resolve_hash_candidates(px, s->sess, s));
 	else
 		return map_get_server_hash(px, hash);
 }
@@ -563,7 +588,7 @@ struct server *get_server_expr(struct stream *s, const struct server *avoid)
 
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, hash, avoid);
+		return chash_get_server_hash(px, hash, avoid, resolve_hash_candidates(px, s->sess, s));
 	else
 		return map_get_server_hash(px, hash);
 }
@@ -584,7 +609,10 @@ struct server *get_server_rnd(struct stream *s, const struct server *avoid)
 	do {
 		prev = curr;
 		hash = statistical_prng();
-		curr = chash_get_server_hash(px, hash, avoid);
+		/* "hash-candidates" doesn't apply here: "balance random" draws a
+		 * fresh random hash per candidate itself via "draws" above.
+		 */
+		curr = chash_get_server_hash(px, hash, avoid, 0);
 		if (!curr)
 			break;
 
@@ -751,12 +779,12 @@ int assign_server(struct stream *s)
 			case BE_LB_HASH_SRC:
 				src = sc_src(s->scf);
 				if (src && src->ss_family == AF_INET) {
-					srv = get_server_sh(s->be,
+					srv = get_server_sh(s,
 							    (void *)&((struct sockaddr_in *)src)->sin_addr,
 							    4, prev_srv);
 				}
 				else if (src && src->ss_family == AF_INET6) {
-					srv = get_server_sh(s->be,
+					srv = get_server_sh(s,
 							    (void *)&((struct sockaddr_in6 *)src)->sin6_addr,
 							    16, prev_srv);
 				}
@@ -776,7 +804,7 @@ int assign_server(struct stream *s)
 						if (!isttest(uri))
 							uri = ist("");
 					}
-					srv = get_server_uh(s->be, uri.ptr, uri.len, prev_srv);
+					srv = get_server_uh(s, uri.ptr, uri.len, prev_srv);
 				}
 				break;
 
@@ -786,7 +814,7 @@ int assign_server(struct stream *s)
 					struct ist uri;
 
 					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
-					srv = get_server_ph(s->be, uri.ptr, uri.len, prev_srv);
+					srv = get_server_ph(s, uri.ptr, uri.len, prev_srv);
 
 					if (!srv && s->txn.http->meth == HTTP_METH_POST)
 						srv = get_server_ph_post(s, prev_srv);

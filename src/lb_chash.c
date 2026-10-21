@@ -411,9 +411,18 @@ static int chash_server_is_eligible(struct server *s)
  * It will also skip server <avoid> if the hash result ends on this one.
  * If no valid server is found, NULL is returned.
  *
+ * <candidates> caps how many servers (the primary one included) are
+ * inspected before giving up on load-shaping and keeping whichever one the
+ * walk is currently on; 0 or negative means unlimited. Callers resolve this
+ * from "hash-candidates" (literal or, where request context is available,
+ * a per-request sample expression) themselves rather than this function
+ * reading p->lbprm.hash_candidates directly, since some callers (e.g.
+ * "balance random", log-balance) deliberately opt out of the cap.
+ *
  * The lbprm's lock will be used in R/O mode. The server's lock is not used.
  */
-struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const struct server *avoid)
+struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const struct server *avoid,
+                                     int candidates)
 {
 	struct eb32_node *next, *prev;
 	struct server *nsrv, *psrv;
@@ -421,6 +430,7 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const s
 	unsigned int dn, dp;
 	int loop;
 	int hashafnty;
+	int cand_left; /* remaining candidates after the current one; <0 means unlimited */
 
 	HA_RWLOCK_RDLOCK(LBPRM_LOCK, &p->lbprm.lock);
 
@@ -468,15 +478,19 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const s
 	loop = 0;
 	hashafnty = p->options3 & PR_O3_HASHAFNTY_MASK;
 
+	cand_left = (candidates > 0) ? candidates - 1 : -1;
+
 	while (nsrv == avoid ||
-			(p->lbprm.hash_balance_factor && !chash_server_is_eligible(nsrv)) ||
-			(hashafnty == PR_O3_HASHAFNTY_MAXCONN &&
+			(cand_left && p->lbprm.hash_balance_factor && !chash_server_is_eligible(nsrv)) ||
+			(cand_left && hashafnty == PR_O3_HASHAFNTY_MAXCONN &&
 				nsrv->maxconn &&
 				nsrv->served >= srv_dynamic_maxconn(nsrv)) ||
-			(hashafnty == PR_O3_HASHAFNTY_MAXQUEUE &&
+			(cand_left && hashafnty == PR_O3_HASHAFNTY_MAXQUEUE &&
 				nsrv->maxconn &&
 				nsrv->maxqueue &&
 				nsrv->served + nsrv->queueslength >= srv_dynamic_maxconn(nsrv) + nsrv->maxqueue)) {
+		if (cand_left > 0)
+			cand_left--;
 		next = eb32_next(next);
 		if (!next) {
 			next = eb32_first(root);

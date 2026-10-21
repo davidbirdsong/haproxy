@@ -6295,6 +6295,7 @@ filter-sequence                           X (!)      X         X         X
 fullconn                                  X          -         X         X
 guid                                      -          X         X         X
 hash-balance-factor                       X          -         X         X
+hash-candidates                           X          -         X         X
 hash-preserve-affinity                    X          -         X         X
 hash-type                                 X          -         X         X
 http-after-response                       X (!)      X         X         X
@@ -8627,7 +8628,43 @@ hash-balance-factor <factor>
   This setting is also used by "balance random" which internally relies on the
   consistent hashing mechanism.
 
-  See also : "balance" and "hash-type".
+  See also : "balance", "hash-candidates" and "hash-type".
+
+hash-candidates <num>
+  Limit how many servers on the hash ring are considered before giving up on
+  load-shaping, for hash-based balancing algorithms.
+
+  May be used in the following contexts: tcp, http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    no    |   no   |   yes
+
+  Arguments :
+    <num> is the maximum number of candidate servers, including the
+          first-choice (primary) one, that may be inspected while walking the
+          hash ring looking for one with available capacity. Setting <num> to
+          0 (the default) disables this limit.
+
+  "hash-balance-factor" and "hash-preserve-affinity" can both cause the
+  primary server selected by the hash to be disqualified, in which case the
+  algorithm keeps walking the hash ring looking for an eligible server. By
+  default that walk is unbounded: it continues until an eligible server is
+  found or the whole ring has been visited. "hash-candidates" caps the number
+  of servers examined this way. Once the limit is reached, the last server
+  looked at is used even if "hash-balance-factor" or "hash-preserve-affinity"
+  would otherwise have disqualified it.
+
+  Setting <num> to 1 means only the primary server is ever considered, which
+  effectively disables the load-shaping performed by "hash-balance-factor"
+  and "hash-preserve-affinity" without having to unset them. Higher values
+  allow progressively more load-shaping at the cost of weaker hash affinity,
+  since requests may land further from their primary server on the ring.
+
+  This setting has no effect on "balance random", which does not walk the
+  ring looking for a fallback candidate; it already controls the equivalent
+  number of candidates via the "draws" parameter of "balance random(<draws>)".
+
+  See also : "balance", "hash-balance-factor" and "hash-preserve-affinity".
 
 hash-preserve-affinity { always | maxconn | maxqueue }
   Specify a method for assigning streams to servers with hash load balancing
@@ -8657,7 +8694,7 @@ hash-preserve-affinity { always | maxconn | maxqueue }
                    picked by following the hashing ring. This has no effect on
                    servers that do not set both "maxconn" and "maxqueue".
 
-  See also : "maxconn", "maxqueue", "hash-balance-factor"
+  See also : "maxconn", "maxqueue", "hash-balance-factor", "hash-candidates"
 
 hash-type <method> <function> <modifier>
   Specify a method to use for mapping hashes to servers
@@ -8754,8 +8791,8 @@ hash-type <method> <function> <modifier>
   default function is "sdbm", the selection of a function should be based on
   the range of the values being hashed.
 
-  See also : "balance", "hash-balance-factor", "hash-preserve-affinity",
-             "server"
+  See also : "balance", "hash-balance-factor", "hash-candidates",
+             "hash-preserve-affinity", "server"
 
 http-after-response <action> <options...> [ { if | unless } <condition> ]
   Access control for all Layer 7 responses (server, applet/service and internal
